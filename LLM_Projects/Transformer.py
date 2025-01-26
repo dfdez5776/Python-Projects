@@ -3,6 +3,9 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from encoder import *
+
+
 
 
 #Hyperparameters
@@ -37,6 +40,7 @@ decode = lambda l: ''.join([itos[i] for i in l])
 
 #Tokenize Entire Library, convert into data tensor
 data = torch.tensor(encode(text), dtype = torch.long)
+image = []
 
 #Split into training/testing
 
@@ -94,17 +98,49 @@ class Head(nn.Module):
           self.value = nn.Linear(n_embd, head_size, bias = False)
           self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
-     def forward(self, x):
+          self.e_key = nn.Linear(n_embd, head_size, bias = False)
+          self.e_query = nn.Linear(n_embd, head_size, bias = False)
+          self.e_value = nn.Linear(n_embd, head_size, bias = False)
+          
+     def forward(self, x, input):
         B,T, C = x.shape
         #A single head
-        k = self.key(x) #B,T,16
-        q = self.query(x)  #B,T,16
-        wei = q @ k.transpose(-2, -1) # (B, T, 16) @ (B, 16, T) ---> (B,T,T)
+        k = self.key(x) #B,T,8
+        q = self.query(x)  #B,T,8
+        
+        wei = q @ k.transpose(-2, -1) # (B, T, 8) @ (B, 8, T) ---> (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei =F.softmax(wei, dim = -1)
         v = self.value(x)
 
-        out = wei @ v# (b,T, T) @ (B, T,C) ---> (B,T,C)
+
+        #Encoder 
+        e_k = self.e_key(input)
+        e_q = self.e_query(input)
+        e_wei = e_q @ e_k.transpose(-2, -1)
+        e_wei = F.softmax(wei, dim = -1)
+
+        e_v = self.e_value(input)
+        e_out = e_wei @ e_v
+
+
+        print(v.shape)
+
+        out = wei @ v # (b,T, T) @ (B, T,C) ---> (B,T,C)
+
+
+        #cross attention
+        #output of encoder multiplied by encoder key matrix,
+        cross_wei = self.query(x)@self.e_key(e_out).transpose(-2, -2)
+        cross_wei = F.softmax(wei, dim = -1)
+        cross_v = self.e_value(e_out)
+
+        cross_out = cross_wei @ cross_v
+
+        out = out + cross_out
+
+
+
         return out
 
 
@@ -145,9 +181,17 @@ class Block(nn.Module):
          self.ln1 = nn.LayerNorm(n_embd)
          self.ln2 = nn.LayerNorm(n_embd)
 
+         self.e_self_attention = MultiHeadAttention(n_head, head_size)
+         self.e_feedforward = FeedForward(n_embd)
+         self.e_llnorm1 = nn.LayerNorm(n_embd)
+         self.e_llnorm2 = nn.LayerNorm(n_embd)
+
+
+         
+
      def forward(self, x):
-         x = x + self.sa(self.ln1(x))
-         x = x +  self.ffwd(self.ln2(x))
+         x = x + self.sa(self.ln1(x), self.e_llnorm1(input))
+         x = x + self.ffwd(self.ln2(x))
          return x
 
 
@@ -163,34 +207,56 @@ class BigramLanguageModel(nn.Module):
                  Block(n_embd, n_head = 4),
                  Block(n_embd, n_head = 4),
                  Block(n_embd, n_head = 4),
-                 nn.LayerNorm(n_embd)
+                 nn.LayerNorm(n_embd))
+
+            #Neural Nets from encoder architecture
+            self.e_blocks = nn.Sequential(
+                blocks(n_embd, n_head = 4),
+                blocks(n_embd, n_head = 4),
+                blocks(n_embd, n_head = 4),
+                nn.LayerNorm(n_embd)
+
+
             )
 
             self.lm_head = nn.Linear(n_embd, vocab_size)
+            self.e_lm_head = nn.Linear(n_embd, vocab_size)
 
-        def forward(self, idx, targets=None):
+        def forward(self, idx, input, targets=None):
              B, T = idx.shape
              #idx and targets are both (B,T) tensor of integers
              tok_emb = self.token_embedding_table(idx) #(BTC)
+             e_tok_emb = self.ImageEmbedding(input)
              pos_emb = self.position_embedding_table(torch.arange(T, device = device)) #(T,C)
+
+             e_x = e_tok_emb
              x = tok_emb + pos_emb
+
+             e_x = self.blocks(e_x)
              x = self.blocks(x)
-             logits = self.lm_head(tok_emb) #(BT, Vocab size)
+
+             e_logits = self.e_lm_head(e_x)
+             logits = self.lm_head(x) #(BT, Vocab size)
 
              if targets is None:
                   loss = None
              else:
                 B, T, C = logits.shape
+                e_logits = logits.view(B*T, C)
                 logits = logits.view(B*T, C)
+                
+                e_targets = targets.view(B*T)
                 targets = targets.view(B*T)
                 #Same as Negative loss likelihood
+                e_loss = F.cross_entropy(e_logits, e_targets)
                 loss = F.cross_entropy(logits, targets)
              
-             return logits, loss
+             return logits, loss, e_logits, e_loss
         
         def generate(self, idx, max_new_tokens):
              # idx its (B,T) array of indices in the current context
              for _ in range(max_new_tokens):
+                    print("generating")
                     #crop idc 
                     idx_cond = idx[:, -block_size:]
                     #get the predictions
@@ -206,32 +272,15 @@ class BigramLanguageModel(nn.Module):
              return idx
         
 m = BigramLanguageModel()
+#endoder
+
 m = m.to(device)
-logits, loss = m(xb, yb)
+
+logits, loss, e_logits, e_loss = m(xb, yb, image)
+
 
 idx = torch.zeros((1,1), dtype = torch.long)
 #print(decode(m.generate(idx = torch.zeros((1,1), dtype = torch.long), max_new_tokens = 100)[0].tolist()))
-
-
-
-#Self Attention 
-
-#Masking matrix of past experiences (average of values seen)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #Training the model
 #Create a Pytorch optimizer (more advanced than SGD)
@@ -249,7 +298,8 @@ for iter in range(max_iters):
     xb, yb = get_batch('train')
 
     #evaluate the loss 
-    logits , loss = m(xb, yb)
+    logits , loss = m(xb, yb, image)
+    print('xb' , xb.shape)
     optimizer.zero_grad(set_to_none= True)
     loss.backward()
     optimizer.step()
