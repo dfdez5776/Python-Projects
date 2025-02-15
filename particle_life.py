@@ -3,7 +3,7 @@ import numpy as np
 #from numba import jit
 import os
 
-
+#i fixed this
 class ParticleLife():
 
     def __init__(self, n_types, n_particles, K, friction):
